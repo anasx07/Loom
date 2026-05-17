@@ -1,6 +1,7 @@
 use crate::agents::traits::{AIProvider, StreamResponse};
-use crate::agents::types::{StreamChunk, Usage};
-use crate::core::{Message, Role, ToolCall, FunctionCall};
+use crate::agents::types::StreamChunk;
+use crate::agents::utils::parse_anthropic_sse;
+use crate::core::{Message, Role, ToolCall};
 use async_stream::stream;
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -17,7 +18,10 @@ impl AnthropicProvider {
     pub fn new(api_key: String) -> Self {
         Self {
             api_key,
-            client: Client::new(),
+            client: Client::builder()
+                .timeout(std::time::Duration::from_secs(60))
+                .build()
+                .unwrap_or_else(|_| Client::new()),
         }
     }
 }
@@ -32,6 +36,9 @@ impl AIProvider for AnthropicProvider {
         // Anthropic doesn't have a public models endpoint in the same way OpenAI does that's easily accessible without specific permissions
         // Returning a common set of models
         Ok(vec![
+            "claude-sonnet-4-5".to_string(),
+            "claude-sonnet-4-20250514".to_string(),
+            "claude-opus-4-20250514".to_string(),
             "claude-3-5-sonnet-20240620".to_string(),
             "claude-3-opus-20240229".to_string(),
             "claude-3-sonnet-20240229".to_string(),
@@ -44,6 +51,7 @@ impl AIProvider for AnthropicProvider {
         messages: Vec<Message>,
         model: &str,
         tools: Option<Vec<Value>>,
+        _thinking_level: Option<&str>,
     ) -> Result<StreamResponse, anyhow::Error> {
         let mut anthropic_messages = Vec::new();
         let mut system_prompt = String::new();
@@ -55,15 +63,44 @@ impl AIProvider for AnthropicProvider {
                         system_prompt.push_str(content);
                     }
                 }
-                _ => {
-                    let role_str = match msg.role {
-                        Role::User => "user",
-                        Role::Assistant => "assistant",
-                        _ => "user",
-                    };
+                Role::User => {
                     anthropic_messages.push(json!({
-                        "role": role_str,
+                        "role": "user",
                         "content": msg.content.unwrap_or_default(),
+                    }));
+                }
+                Role::Assistant => {
+                    let mut content = Vec::new();
+                    if let Some(t) = &msg.thought {
+                        content.push(json!({ "type": "thought", "thought": t }));
+                    }
+                    if let Some(c) = &msg.content {
+                        content.push(json!({ "type": "text", "text": c }));
+                    }
+                    if let Some(calls) = &msg.tool_calls {
+                        for tc in calls {
+                            let input: Value = serde_json::from_str(&tc.function.arguments).unwrap_or(json!({}));
+                            content.push(json!({
+                                "type": "tool_use",
+                                "id": tc.id,
+                                "name": tc.function.name,
+                                "input": input,
+                            }));
+                        }
+                    }
+                    anthropic_messages.push(json!({
+                        "role": "assistant",
+                        "content": content,
+                    }));
+                }
+                Role::Tool => {
+                    anthropic_messages.push(json!({
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": msg.tool_call_id.unwrap_or_default(),
+                            "content": msg.content.unwrap_or_default(),
+                        }],
                     }));
                 }
             }
@@ -73,7 +110,7 @@ impl AIProvider for AnthropicProvider {
             "model": model,
             "messages": anthropic_messages,
             "stream": true,
-            "max_tokens": 4096,
+            "max_tokens": 16384,
         });
 
         if !system_prompt.is_empty() {
@@ -110,68 +147,15 @@ impl AIProvider for AnthropicProvider {
 
         let mut bytes_stream = response.bytes_stream();
         let mut buffer = String::new();
-        let mut active_tool_calls: HashMap<String, ToolCall> = HashMap::new();
+        let mut active_tool_calls: HashMap<usize, ToolCall> = HashMap::new();
 
         let s = stream! {
             while let Some(item) = bytes_stream.next().await {
                 match item {
                     Ok(bytes) => {
-                        buffer.push_str(&String::from_utf8_lossy(&bytes));
-                        while let Some(line_end) = buffer.find('\n') {
-                            let line = buffer[..line_end].to_string();
-                            buffer.drain(..=line_end);
-                            let line = line.trim();
-                            if line.is_empty() { continue; }
-
-                            if let Some(data) = line.strip_prefix("data: ") {
-                                if let Ok(val) = serde_json::from_str::<Value>(data) {
-                                    let event_type = val["type"].as_str().unwrap_or("");
-                                    match event_type {
-                                        "content_block_delta" => {
-                                            if let Some(delta) = val.get("delta") {
-                                                if let Some(text) = delta["text"].as_str() {
-                                                    yield Ok(StreamChunk::Text { content: text.to_string() });
-                                                }
-                                                if let Some(_partial_json) = delta["partial_json"].as_str() {
-                                                    // Handle partial tool call JSON
-                                                    // In Anthropic, we get tool_use blocks
-                                                }
-                                            }
-                                        }
-                                        "content_block_start" => {
-                                            if let Some(block) = val.get("content_block") {
-                                                if block["type"] == "tool_use" {
-                                                    let id = block["id"].as_str().unwrap_or("").to_string();
-                                                    let name = block["name"].as_str().unwrap_or("").to_string();
-                                                    active_tool_calls.insert(id.clone(), ToolCall {
-                                                        id,
-                                                        r#type: "function".to_string(),
-                                                        index: None,
-                                                        function: FunctionCall {
-                                                            name,
-                                                            arguments: String::new(),
-                                                        },
-                                                    });
-                                                }
-                                            }
-                                        }
-                                        "message_delta" => {
-                                            if let Some(usage) = val.get("usage") {
-                                                let prompt = usage["input_tokens"].as_u64().unwrap_or(0) as u32;
-                                                let completion = usage["output_tokens"].as_u64().unwrap_or(0) as u32;
-                                                yield Ok(StreamChunk::Usage {
-                                                    usage: Usage {
-                                                        prompt_tokens: prompt,
-                                                        completion_tokens: completion,
-                                                        total_tokens: prompt + completion,
-                                                    }
-                                                });
-                                            }
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            }
+                        let chunks = parse_anthropic_sse(&mut buffer, &mut active_tool_calls, &String::from_utf8_lossy(&bytes));
+                        for chunk in chunks {
+                            yield Ok(chunk);
                         }
                     }
                     Err(e) => yield Err(anyhow::Error::from(e)),

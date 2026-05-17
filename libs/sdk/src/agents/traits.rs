@@ -15,5 +15,6 @@ pub trait AIProvider: Send + Sync {
         messages: Vec<Message>,
         model: &str,
         tools: Option<Vec<serde_json::Value>>,
+        thinking_level: Option<&str>,
     ) -> Result<StreamResponse, anyhow::Error>;
 }

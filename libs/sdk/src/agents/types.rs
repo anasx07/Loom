@@ -1,5 +1,15 @@
-use crate::core::ToolCall;
+use crate::core::{ToolCall, Message};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+
+#[derive(Debug, Clone)]
+pub enum ConfirmationResponse {
+    AllowOnce,
+    AllowSession,
+    AllowWorkspace,
+    Deny,
+    Feedback(String),
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -23,6 +33,19 @@ pub enum StreamChunk {
     },
     Error {
         content: String,
+    },
+    FinalHistory {
+        history: Vec<Message>,
+    },
+    Models {
+        models: Vec<crate::core::DynamicModelInfo>,
+    },
+    ModelsDone,
+    RequestConfirmation {
+        message: String,
+        target: String,
+        #[serde(skip)]
+        tx: Option<Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<ConfirmationResponse>>>>>,
     },
     Done,
 }
