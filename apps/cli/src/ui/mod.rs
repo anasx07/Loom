@@ -147,6 +147,9 @@ pub struct App {
     pub cached_text: Option<ratatui::text::Text<'static>>,
     pub pending_command_confirmation: Option<(String, String, std::sync::Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<routecode_sdk::agents::types::ConfirmationResponse>>>>)>,
     pub inputting_command_feedback: bool,
+    pub show_user_msg_modal: Option<usize>,
+    pub user_msg_modal_selected: usize,
+    pub cached_hovered_msg_idx: Option<usize>,
     pub session_id: String,
 }
 
@@ -227,6 +230,9 @@ impl App {
             cached_text: None,
             pending_command_confirmation: None,
             inputting_command_feedback: false,
+            show_user_msg_modal: None,
+            user_msg_modal_selected: 0,
+            cached_hovered_msg_idx: None,
             session_id: format!("session_{}", chrono::Utc::now().format("%Y%m%d_%H%M%S")),
         }
     }
@@ -298,7 +304,7 @@ pub fn compute_thinking_hover(app: &App, size: ratatui::layout::Rect) -> bool {
 
     // Build the history text and compute wrapping to find which logical line the target row maps to
     let is_collapsed = app.collapse_thinking && !app.temp_expand_thinking;
-    let history_text = render_history(&app.history, is_collapsed, app.thinking_hover_rendered);
+    let history_text = render_history(&app.history, is_collapsed, app.thinking_hover_rendered, None, 0);
     let available_width = size.width.max(1) as usize;
     let calc_width = (available_width as f32 * 0.95).floor().max(1.0) as usize;
 
@@ -321,6 +327,55 @@ pub fn compute_thinking_hover(app: &App, size: ratatui::layout::Rect) -> bool {
     false
 }
 
+/// Compute which message is hovered by the mouse.
+pub fn compute_message_hover(app: &App, size: ratatui::layout::Rect) -> Option<usize> {
+    let mouse_row = match app.mouse_row {
+        Some(r) => r,
+        None => return None,
+    };
+    if app.screen != Screen::Session {
+        return None;
+    }
+
+    let input_height = (app.input.lines().len() as u16 + 2).min(12);
+    let area_height = size.height.saturating_sub(1);
+    let history_height = area_height.saturating_sub(input_height).saturating_sub(1);
+
+    if mouse_row < 1 || mouse_row >= 1 + history_height {
+        return None;
+    }
+
+    let viewport_row = mouse_row - 1;
+    let target_visual_row = viewport_row as usize + app.history_scroll as usize;
+
+    let is_collapsed = app.collapse_thinking && !app.temp_expand_thinking;
+    let available_width = size.width.max(1) as usize;
+    let calc_width = (available_width as f32 * 0.95).floor().max(1.0) as usize;
+
+    let mut cumulative_visual_row: usize = 0;
+
+    for (msg_idx, m) in app.history.iter().enumerate() {
+        let msg_slice = std::slice::from_ref(m);
+        let msg_text = session::render_history(msg_slice, is_collapsed, app.thinking_hover_rendered, None, msg_idx);
+
+        let mut msg_height: usize = 0;
+        for line in &msg_text.lines {
+            let line_width: usize = line.spans.iter().map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref())).sum();
+            let wrapped_height = if line_width == 0 { 1 } else {
+                (line_width + calc_width - 1) / calc_width
+            };
+            msg_height += wrapped_height;
+        }
+
+        if target_visual_row >= cumulative_visual_row && target_visual_row < cumulative_visual_row + msg_height {
+            return Some(msg_idx);
+        }
+        cumulative_visual_row += msg_height;
+    }
+
+    None
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KeyEventResult {
     Continue,
@@ -332,6 +387,33 @@ async fn handle_key_event(
     key: event::KeyEvent,
     is_burst: bool,
 ) -> io::Result<KeyEventResult> {
+    if let Some(msg_idx) = app.show_user_msg_modal {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.user_msg_modal_selected = if app.user_msg_modal_selected == 0 { 1 } else { 0 };
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                app.user_msg_modal_selected = if app.user_msg_modal_selected == 1 { 0 } else { 1 };
+            }
+            KeyCode::Enter => {
+                let text = app.history[msg_idx].content.as_ref().map(|s| s.to_string()).unwrap_or_default();
+                if app.user_msg_modal_selected == 0 {
+                    let _ = copy_to_clipboard(&text);
+                    app.history.push(Message::system("Message copied to clipboard!".to_string()));
+                } else {
+                    app.history.truncate(msg_idx);
+                    app.input = tui_textarea::TextArea::from(text.lines().map(|s| s.to_string()));
+                    app.input.move_cursor(tui_textarea::CursorMove::End);
+                }
+                app.show_user_msg_modal = None;
+            }
+            KeyCode::Esc => {
+                app.show_user_msg_modal = None;
+            }
+            _ => {}
+        }
+        return Ok(KeyEventResult::Continue);
+    }
     if app.pending_command_confirmation.is_some() {
         if app.inputting_command_feedback {
             match key.code {
@@ -904,7 +986,38 @@ async fn handle_mouse_event<B: ratatui::backend::Backend>(
             }
         }
         MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left) => {
-            if app.show_menu || app.show_provider_menu || app.show_model_menu || app.show_settings_menu {
+            if let Some(msg_idx) = app.show_user_msg_modal {
+                if let Ok(size) = terminal.size() {
+                    let width = (size.width as f32 * 0.40) as u16;
+                    let height = 8;
+                    let modal_x = (size.width.saturating_sub(width)) / 2;
+                    let modal_y = (size.height.saturating_sub(height)) / 2;
+                    
+                    let is_outside = mouse.column < modal_x || mouse.column >= modal_x + width || mouse.row < modal_y || mouse.row >= modal_y + height;
+                    
+                    if is_outside {
+                        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                            app.show_user_msg_modal = None;
+                        }
+                    } else if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
+                        let click_row = mouse.row;
+                        if click_row == modal_y + 2 {
+                            app.user_msg_modal_selected = 0;
+                            let text = app.history[msg_idx].content.as_ref().map(|s| s.to_string()).unwrap_or_default();
+                            let _ = copy_to_clipboard(&text);
+                            app.history.push(Message::system("Message copied to clipboard!".to_string()));
+                            app.show_user_msg_modal = None;
+                        } else if click_row == modal_y + 3 {
+                            app.user_msg_modal_selected = 1;
+                            let text = app.history[msg_idx].content.as_ref().map(|s| s.to_string()).unwrap_or_default();
+                            app.history.truncate(msg_idx);
+                            app.input = tui_textarea::TextArea::from(text.lines().map(|s| s.to_string()));
+                            app.input.move_cursor(tui_textarea::CursorMove::End);
+                            app.show_user_msg_modal = None;
+                        }
+                    }
+                }
+            } else if app.show_menu || app.show_provider_menu || app.show_model_menu || app.show_settings_menu {
                 if let Ok(size) = terminal.size() {
                     let (width, height) = if app.show_menu {
                         (60, (app.filtered_commands.len() + 6).min(15) as u16)
@@ -964,6 +1077,18 @@ async fn handle_mouse_event<B: ratatui::backend::Backend>(
                 }
             } else if app.screen == Screen::Session {
                 let has_thinking = app.history.iter().any(|m| m.thought.is_some());
+                if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
+                    if let Ok(size) = terminal.size() {
+                        if let Some(msg_idx) = compute_message_hover(app, size) {
+                            if app.history[msg_idx].role == Role::User {
+                                app.show_user_msg_modal = Some(msg_idx);
+                                app.user_msg_modal_selected = 0;
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+                
                 if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
                     let in_cooldown = app.last_toggle_time.map_or(false, |t| t.elapsed() < std::time::Duration::from_millis(400));
                     
@@ -1157,6 +1282,7 @@ fn ui(f: &mut Frame, app: &mut App) {
     else if app.pending_clear { render_confirmation_dialog(f, "Are you sure you want to clear all history? (y/n)"); }
     else if app.pending_exit { render_confirmation_dialog(f, "Are you sure you want to exit RouteCode? (y/n)"); }
     else if app.pending_command_confirmation.is_some() { render_command_confirmation_dialog(f, app); }
+    else if app.show_user_msg_modal.is_some() { render_user_msg_modal(f, app); }
 }
 
 fn render_command_confirmation_dialog(f: &mut Frame, app: &mut App) {
@@ -1263,6 +1389,108 @@ fn render_confirmation_dialog(f: &mut Frame, message: &str) {
     f.render_widget(p, popup_horiz[1]);
 }
 
+fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let mut child = Command::new("clip")
+            .stdin(Stdio::piped())
+            .spawn()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(text.as_bytes())?;
+        }
+        let _ = child.wait();
+        Ok(())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let mut child = Command::new("pbcopy")
+            .stdin(Stdio::piped())
+            .spawn()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(text.as_bytes())?;
+        }
+        let _ = child.wait();
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        if let Ok(mut child) = Command::new("xclip")
+            .arg("-selection")
+            .arg("clipboard")
+            .stdin(Stdio::piped())
+            .spawn()
+        {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            let _ = child.wait();
+        }
+        Ok(())
+    }
+}
+
+fn render_user_msg_modal(f: &mut Frame, app: &mut App) {
+    let area = f.size();
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(40),
+            Constraint::Length(8),
+            Constraint::Percentage(40),
+        ])
+        .split(area);
+
+    let popup_horiz = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(30),
+            Constraint::Percentage(40),
+            Constraint::Percentage(30),
+        ])
+        .split(popup_layout[1]);
+
+    let inner_area = popup_horiz[1];
+
+    let block = Block::default()
+        .title(" Message Action ")
+        .borders(ratatui::widgets::Borders::ALL)
+        .border_style(Style::default().fg(COLOR_PRIMARY))
+        .style(Style::default().bg(COLOR_BG));
+
+    let options = vec!["Copy Message", "Rewind & Edit"];
+    let mut lines = vec![
+        ratatui::text::Line::from(vec![Span::styled(" Choose an action:", Style::default().fg(COLOR_SECONDARY))]),
+        ratatui::text::Line::from(""),
+    ];
+
+    for (idx, opt) in options.iter().enumerate() {
+        let is_selected = idx == app.user_msg_modal_selected;
+        let prefix = if is_selected { " ➜ " } else { "   " };
+        let style = if is_selected {
+            Style::default().fg(COLOR_PRIMARY).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(COLOR_TEXT)
+        };
+        lines.push(ratatui::text::Line::from(vec![
+            Span::styled(prefix, Style::default().fg(COLOR_PRIMARY)),
+            Span::styled(opt.to_string(), style),
+        ]));
+    }
+    
+    lines.push(ratatui::text::Line::from(""));
+    lines.push(ratatui::text::Line::from(vec![Span::styled(" Press Enter/Click to select, Esc to close", Style::default().fg(COLOR_DIM))]));
+
+    let paragraph = Paragraph::new(lines).block(block);
+    f.render_widget(ratatui::widgets::Clear, inner_area);
+    f.render_widget(paragraph, inner_area);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1326,5 +1554,32 @@ mod tests {
         
         assert!(!app.show_menu);
         assert!(app.filtered_commands.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_user_msg_modal_rewind() {
+        let orchestrator = Arc::new(AgentOrchestrator::new(
+            Arc::new(MockProvider),
+            Arc::new(ToolRegistry::new()),
+            Arc::new(Mutex::new(Config::default())),
+        ));
+        let mut app = App::new(orchestrator, "Mock".to_string());
+        
+        app.history.push(Message::user("First message".to_string()));
+        app.history.push(Message::assistant(Some("Assistant reply".into()), None, None));
+        app.history.push(Message::user("Second message".to_string()));
+        
+        app.show_user_msg_modal = Some(2);
+        app.user_msg_modal_selected = 1;
+        
+        let enter_key = event::KeyEvent::new(event::KeyCode::Enter, event::KeyModifiers::empty());
+        let res = handle_key_event(&mut app, enter_key, false).await.unwrap();
+        
+        assert_eq!(res, KeyEventResult::Continue);
+        assert_eq!(app.show_user_msg_modal, None);
+        assert_eq!(app.history.len(), 2);
+        assert_eq!(app.history[0].role, Role::User);
+        assert_eq!(app.history[1].role, Role::Assistant);
+        assert_eq!(app.input.lines()[0], "Second message");
     }
 }

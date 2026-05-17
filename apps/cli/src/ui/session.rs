@@ -26,15 +26,18 @@ pub fn ui_session(f: &mut Frame, app: &mut App, area: Rect) -> Rect {
         m.tool_calls.as_ref().map(|tc| tc.len()).unwrap_or(0)
     }).unwrap_or(0);
 
+    let hovered_msg_idx = crate::ui::compute_message_hover(app, chunks[0]);
+
     let cache_valid = app.cached_text.is_some()
         && app.history.len() == app.cached_history_len
         && last_msg_len == app.cached_last_msg_len
         && chunks[0].width == app.cached_width
         && is_collapsed == app.cached_is_collapsed
-        && thinking_hovered == app.cached_thinking_hovered;
+        && thinking_hovered == app.cached_thinking_hovered
+        && hovered_msg_idx == app.cached_hovered_msg_idx;
 
     if !cache_valid {
-        let history = render_history(&app.history, is_collapsed, thinking_hovered);
+        let history = render_history(&app.history, is_collapsed, thinking_hovered, hovered_msg_idx, 0);
         
         // 1. Auto-scroll logic
         let mut total_height: usize = 0;
@@ -56,6 +59,7 @@ pub fn ui_session(f: &mut Frame, app: &mut App, area: Rect) -> Rect {
         app.cached_width = chunks[0].width;
         app.cached_is_collapsed = is_collapsed;
         app.cached_thinking_hovered = thinking_hovered;
+        app.cached_hovered_msg_idx = hovered_msg_idx;
         app.cached_total_height = total_height;
         app.cached_text = Some(history);
     }
@@ -144,17 +148,40 @@ pub fn ui_session(f: &mut Frame, app: &mut App, area: Rect) -> Rect {
     chunks[1]
 }
 
-pub fn render_history(history: &[Message], collapse_thinking: bool, thinking_hovered: bool) -> Text<'static> {
+pub fn render_history(
+    history: &[Message],
+    collapse_thinking: bool,
+    thinking_hovered: bool,
+    hovered_msg_idx: Option<usize>,
+    history_offset: usize,
+) -> Text<'static> {
     let mut lines = Vec::new();
-    for m in history {
+    for (idx, m) in history.iter().enumerate() {
+        let original_idx = idx + history_offset;
         match m.role {
             Role::User => {
+                let is_hovered = Some(original_idx) == hovered_msg_idx;
+                let user_style = if is_hovered {
+                    Style::default().fg(COLOR_PRIMARY).add_modifier(Modifier::BOLD).add_modifier(Modifier::UNDERLINED)
+                } else {
+                    Style::default().fg(COLOR_PRIMARY).add_modifier(Modifier::BOLD)
+                };
+                let tag = if is_hovered {
+                    " ● User (Click to edit/copy)"
+                } else {
+                    " ● User"
+                };
                 lines.push(Line::from(vec![
-                    Span::styled(" ● User", Style::default().fg(COLOR_PRIMARY).add_modifier(Modifier::BOLD)),
+                    Span::styled(tag, user_style),
                 ]));
                 if let Some(content) = &m.content {
                     for line in content.lines() {
-                        lines.push(Line::from(vec![Span::raw("   "), Span::raw(line.to_string())]));
+                        let text_style = if is_hovered {
+                            Style::default().fg(COLOR_TEXT).add_modifier(Modifier::UNDERLINED)
+                        } else {
+                            Style::default().fg(COLOR_TEXT)
+                        };
+                        lines.push(Line::from(vec![Span::raw("   "), Span::styled(line.to_string(), text_style)]));
                     }
                 }
             }
@@ -225,14 +252,67 @@ pub fn render_history(history: &[Message], collapse_thinking: bool, thinking_hov
 
                 if let Some(content) = &m.content {
                     let mut in_code_block = false;
-                    for line in content.lines() {
-                        if line.trim().starts_with("```") {
-                            in_code_block = !in_code_block;
-                            lines.push(Line::from(vec![Span::raw("   "), Span::styled(line.to_string(), Style::default().fg(COLOR_PRIMARY).add_modifier(Modifier::BOLD))]));
+                    let raw_lines: Vec<&str> = content.lines().collect();
+                    let mut i = 0;
+                    while i < raw_lines.len() {
+                        let line = raw_lines[i];
+                        
+                        let mut table_start = None;
+                        if !in_code_block && line.contains('|') {
+                            if i + 1 < raw_lines.len() && is_delimiter_row(raw_lines[i + 1]) {
+                                table_start = Some((i + 1, vec![line]));
+                            } else if i + 2 < raw_lines.len() && raw_lines[i + 1].contains('|') && is_delimiter_row(raw_lines[i + 2]) {
+                                table_start = Some((i + 2, vec![line, raw_lines[i + 1]]));
+                            }
+                        }
+
+                        if let Some((delimiter_idx, header_lines)) = table_start {
+                            let parsed_headers: Vec<Vec<String>> = header_lines.iter().map(|l| parse_table_row(l)).collect();
+                            let num_cols = parsed_headers.iter().map(|h| h.len()).max().unwrap_or(0);
+                            let mut header_row = vec![String::new(); num_cols];
+                            for h in &parsed_headers {
+                                for col_idx in 0..num_cols {
+                                    if col_idx < h.len() {
+                                        let cell = h[col_idx].trim();
+                                        if !cell.is_empty() {
+                                            if !header_row[col_idx].is_empty() {
+                                                header_row[col_idx].push_str(" / ");
+                                            }
+                                            header_row[col_idx].push_str(cell);
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            let delimiter_row = parse_table_row(raw_lines[delimiter_idx]);
+                            let mut alignments = Vec::new();
+                            for cell in delimiter_row {
+                                alignments.push(parse_alignment(&cell));
+                            }
+                            
+                            while alignments.len() < num_cols {
+                                alignments.push(TableAlignment::Left);
+                            }
+                            
+                            let mut rows = Vec::new();
+                            let mut j = delimiter_idx + 1;
+                            while j < raw_lines.len() && raw_lines[j].contains('|') && !is_delimiter_row(raw_lines[j]) {
+                                rows.push(parse_table_row(raw_lines[j]));
+                                j += 1;
+                            }
+                            
+                            render_table_spans(&header_row, &alignments, &rows, &mut lines);
+                            i = j;
                         } else {
-                            let mut line_spans = vec![Span::raw("   ")];
-                            line_spans.extend(parse_markdown_line(line, in_code_block));
-                            lines.push(Line::from(line_spans));
+                            if line.trim().starts_with("```") {
+                                in_code_block = !in_code_block;
+                                lines.push(Line::from(vec![Span::raw("   "), Span::styled(line.to_string(), Style::default().fg(COLOR_PRIMARY).add_modifier(Modifier::BOLD))]));
+                            } else {
+                                let mut line_spans = vec![Span::raw("   ")];
+                                line_spans.extend(parse_markdown_line(line, in_code_block));
+                                lines.push(Line::from(line_spans));
+                            }
+                            i += 1;
                         }
                     }
                 }
@@ -379,4 +459,165 @@ fn parse_inline_markdown(text: &str) -> Vec<Span<'static>> {
     }
 
     spans
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum TableAlignment {
+    Left,
+    Center,
+    Right,
+}
+
+fn is_delimiter_row(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    trimmed.chars().all(|c| c == '-' || c == ':' || c == '|' || c.is_whitespace())
+}
+
+fn parse_table_row(line: &str) -> Vec<String> {
+    let trimmed_line = line.trim();
+    let mut cells: Vec<String> = trimmed_line
+        .split('|')
+        .map(|s| s.trim().to_string())
+        .collect();
+    
+    if trimmed_line.starts_with('|') && !cells.is_empty() {
+        cells.remove(0);
+    }
+    if trimmed_line.ends_with('|') && !cells.is_empty() && cells.last().unwrap().is_empty() {
+        cells.pop();
+    }
+    cells
+}
+
+fn parse_alignment(cell: &str) -> TableAlignment {
+    let trimmed = cell.trim();
+    let left = trimmed.starts_with(':');
+    let right = trimmed.ends_with(':');
+    if left && right {
+        TableAlignment::Center
+    } else if right {
+        TableAlignment::Right
+    } else {
+        TableAlignment::Left
+    }
+}
+
+fn pad_cell(text: &str, width: usize, alignment: TableAlignment) -> String {
+    let text_len = text.chars().count();
+    if text_len >= width {
+        return text.to_string();
+    }
+    
+    let total_pad = width - text_len;
+    match alignment {
+        TableAlignment::Left => {
+            let left_pad = 1;
+            let right_pad = total_pad - 1;
+            format!("{}{}{}", " ".repeat(left_pad), text, " ".repeat(right_pad))
+        }
+        TableAlignment::Right => {
+            let left_pad = total_pad - 1;
+            let right_pad = 1;
+            format!("{}{}{}", " ".repeat(left_pad), text, " ".repeat(right_pad))
+        }
+        TableAlignment::Center => {
+            let left_pad = total_pad / 2;
+            let right_pad = total_pad - left_pad;
+            format!("{}{}{}", " ".repeat(left_pad), text, " ".repeat(right_pad))
+        }
+    }
+}
+
+fn render_table_spans(
+    header_row: &[String],
+    alignments: &[TableAlignment],
+    rows: &[Vec<String>],
+    lines: &mut Vec<Line<'static>>,
+) {
+    let num_cols = header_row.len();
+    if num_cols == 0 {
+        return;
+    }
+    
+    let mut col_widths = vec![0; num_cols];
+    for (col_idx, cell) in header_row.iter().enumerate() {
+        col_widths[col_idx] = col_widths[col_idx].max(cell.chars().count());
+    }
+    for row in rows {
+        for col_idx in 0..num_cols {
+            if col_idx < row.len() {
+                col_widths[col_idx] = col_widths[col_idx].max(row[col_idx].chars().count());
+            }
+        }
+    }
+    
+    for w in col_widths.iter_mut() {
+        *w += 2;
+    }
+    
+    let mut top_line = String::from("   ┌");
+    for (idx, &w) in col_widths.iter().enumerate() {
+        top_line.push_str(&"─".repeat(w));
+        if idx + 1 < num_cols {
+            top_line.push('┬');
+        } else {
+            top_line.push('┐');
+        }
+    }
+    lines.push(Line::from(vec![Span::styled(top_line, Style::default().fg(COLOR_DIM))]));
+    
+    let mut header_spans = vec![Span::styled("   │", Style::default().fg(COLOR_DIM))];
+    for (idx, cell) in header_row.iter().enumerate() {
+        let width = col_widths[idx];
+        let padded = pad_cell(cell, width, alignments[idx]);
+        header_spans.push(Span::styled(padded, Style::default().fg(COLOR_PRIMARY).add_modifier(Modifier::BOLD)));
+        header_spans.push(Span::styled("│", Style::default().fg(COLOR_DIM)));
+    }
+    lines.push(Line::from(header_spans));
+    
+    let mut mid_line = String::from("   ├");
+    for (idx, &w) in col_widths.iter().enumerate() {
+        mid_line.push_str(&"─".repeat(w));
+        if idx + 1 < num_cols {
+            mid_line.push('┼');
+        } else {
+            mid_line.push('┤');
+        }
+    }
+    lines.push(Line::from(vec![Span::styled(mid_line, Style::default().fg(COLOR_DIM))]));
+    
+    for row in rows {
+        let mut row_spans = vec![Span::styled("   │", Style::default().fg(COLOR_DIM))];
+        for col_idx in 0..num_cols {
+            let width = col_widths[col_idx];
+            let cell_text = if col_idx < row.len() { &row[col_idx] } else { "" };
+            let padded = pad_cell(cell_text, width, alignments[col_idx]);
+            
+            let cell_style = if cell_text.contains("Complete") || cell_text.contains("Active") || cell_text.contains("[x]") || cell_text.contains("✅") {
+                Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD)
+            } else if cell_text.contains("Pending") || cell_text.contains("Waiting") {
+                Style::default().fg(COLOR_SYSTEM).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(COLOR_TEXT)
+            };
+            
+            row_spans.push(Span::styled(padded, cell_style));
+            row_spans.push(Span::styled("│", Style::default().fg(COLOR_DIM)));
+        }
+        lines.push(Line::from(row_spans));
+    }
+    
+    let mut bot_line = String::from("   └");
+    for (idx, &w) in col_widths.iter().enumerate() {
+        bot_line.push_str(&"─".repeat(w));
+        if idx + 1 < num_cols {
+            bot_line.push('┴');
+        } else {
+            bot_line.push('┘');
+        }
+    }
+    lines.push(Line::from(vec![Span::styled(bot_line, Style::default().fg(COLOR_DIM))]));
 }
