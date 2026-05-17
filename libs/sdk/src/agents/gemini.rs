@@ -1,11 +1,12 @@
 use crate::agents::traits::{AIProvider, StreamResponse};
 use crate::agents::types::StreamChunk;
-use crate::core::{Message, Role};
+use crate::core::{FunctionCall, Message, Role, ToolCall};
 use async_stream::stream;
 use async_trait::async_trait;
 use futures::StreamExt;
 use reqwest::Client;
 use serde_json::{json, Value};
+use uuid::Uuid;
 
 pub struct GeminiProvider {
     api_key: String,
@@ -16,7 +17,10 @@ impl GeminiProvider {
     pub fn new(api_key: String) -> Self {
         Self {
             api_key,
-            client: Client::new(),
+            client: Client::builder()
+                .timeout(std::time::Duration::from_secs(60))
+                .build()
+                .unwrap_or_else(|_| Client::new()),
         }
     }
 }
@@ -28,11 +32,34 @@ impl AIProvider for GeminiProvider {
     }
 
     async fn list_models(&self) -> Result<Vec<String>, anyhow::Error> {
-        Ok(vec![
-            "gemini-1.5-pro".to_string(),
-            "gemini-1.5-flash".to_string(),
-            "gemini-1.0-pro".to_string(),
-        ])
+        let url = format!(
+            "https://generativelanguage.googleapis.com/v1beta/models?key={}",
+            self.api_key
+        );
+
+        let response = self.client.get(&url).send().await?;
+
+        if !response.status().is_success() {
+            return Ok(vec![
+                "gemini-1.5-pro".to_string(),
+                "gemini-1.5-flash".to_string(),
+                "gemini-2.0-flash-exp".to_string(),
+            ]);
+        }
+
+        let val: Value = response.json().await?;
+        let mut models = Vec::new();
+
+        if let Some(models_arr) = val["models"].as_array() {
+            for m in models_arr {
+                if let Some(name) = m["name"].as_str() {
+                    let id = name.strip_prefix("models/").unwrap_or(name);
+                    models.push(id.to_string());
+                }
+            }
+        }
+
+        Ok(models)
     }
 
     async fn ask(
@@ -40,30 +67,105 @@ impl AIProvider for GeminiProvider {
         messages: Vec<Message>,
         model: &str,
         _tools: Option<Vec<Value>>,
+        _thinking_level: Option<&str>,
     ) -> Result<StreamResponse, anyhow::Error> {
-        let mut contents = Vec::new();
-        for msg in messages {
-            let role = match msg.role {
-                Role::User => "user",
-                Role::Assistant => "model",
-                _ => "user", // Default to user for others
-            };
-            contents.push(json!({
-                "role": role,
-                "parts": [{"text": msg.content.unwrap_or_default()}]
-            }));
-        }
-
         let url = format!(
             "https://generativelanguage.googleapis.com/v1beta/models/{}:streamGenerateContent?key={}",
             model, self.api_key
         );
 
-        let body = json!({
+        let mut contents = Vec::new();
+        let mut system_instruction = String::new();
+
+        for msg in messages {
+            match msg.role {
+                Role::System => {
+                    if let Some(c) = &msg.content {
+                        system_instruction.push_str(c);
+                    }
+                }
+                Role::User => {
+                    contents.push(json!({
+                        "role": "user",
+                        "parts": [{ "text": msg.content.unwrap_or_default() }]
+                    }));
+                }
+                Role::Assistant => {
+                    let mut parts = Vec::new();
+                    if let Some(c) = &msg.content {
+                        parts.push(json!({ "text": c }));
+                    }
+                    if let Some(calls) = &msg.tool_calls {
+                        for tc in calls {
+                            let args: Value = serde_json::from_str(&tc.function.arguments).unwrap_or(json!({}));
+                            parts.push(json!({
+                                "functionCall": {
+                                    "name": tc.function.name,
+                                    "args": args
+                                }
+                            }));
+                        }
+                    }
+                    if !parts.is_empty() {
+                        contents.push(json!({
+                            "role": "model",
+                            "parts": parts
+                        }));
+                    }
+                }
+                Role::Tool => {
+                    let fn_name = msg.name.clone().unwrap_or_else(|| "tool".to_string());
+                    contents.push(json!({
+                        "role": "function",
+                        "parts": [{
+                            "functionResponse": {
+                                "name": fn_name,
+                                "response": { "result": msg.content.unwrap_or_default() }
+                            }
+                        }]
+                    }));
+                }
+            }
+        }
+
+        let mut body = json!({
             "contents": contents,
         });
 
-        let response = self.client.post(&url).json(&body).send().await?;
+        if !system_instruction.is_empty() {
+            body["systemInstruction"] = json!({
+                "parts": [{ "text": system_instruction }]
+            });
+        }
+
+        if let Some(level) = _thinking_level {
+            if level != "default" {
+                body["thinking_level"] = json!(level);
+            }
+        }
+
+        if let Some(t) = _tools {
+            let mut gemini_tools = Vec::new();
+            for tool in t {
+                if let Some(f) = tool.get("function") {
+                    gemini_tools.push(json!({
+                        "name": f["name"],
+                        "description": f["description"],
+                        "parameters": f["parameters"],
+                    }));
+                }
+            }
+            if !gemini_tools.is_empty() {
+                body["tools"] = json!([{ "function_declarations": gemini_tools }]);
+            }
+        }
+
+        let response = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await?;
 
         if !response.status().is_success() {
             let err_text = response.text().await?;
@@ -78,16 +180,53 @@ impl AIProvider for GeminiProvider {
                 match item {
                     Ok(bytes) => {
                         buffer.push_str(&String::from_utf8_lossy(&bytes));
-                        // Gemini returns a JSON array of objects over the stream, but not standard SSE
-                        // It's actually a bit tricky to parse manually without a proper stream decoder if it's large
-                        // For now, let's assume it's small enough or comes in chunks of JSON objects
-                        if let Ok(val) = serde_json::from_str::<Value>(&buffer) {
-                             if let Some(candidates) = val[0]["candidates"].as_array() {
-                                if let Some(text) = candidates[0]["content"]["parts"][0]["text"].as_str() {
-                                    yield Ok(StreamChunk::Text { content: text.to_string() });
+                        loop {
+                            let trimmed = buffer.trim_start_matches(|c: char| c == '[' || c == ']' || c == ',' || c.is_whitespace());
+                            if trimmed.len() < buffer.len() {
+                                let cut = buffer.len() - trimmed.len();
+                                buffer.drain(..cut);
+                            }
+
+                            if buffer.is_empty() {
+                                break;
+                            }
+
+                            let mut stream = serde_json::Deserializer::from_str(&buffer).into_iter::<Value>();
+                            match stream.next() {
+                                Some(Ok(val)) => {
+                                    let offset = stream.byte_offset();
+                                    if let Some(candidates) = val["candidates"].as_array() {
+                                        if let Some(content) = candidates[0].get("content") {
+                                            if let Some(parts) = content["parts"].as_array() {
+                                                for part in parts {
+                                                    if let Some(text) = part["text"].as_str() {
+                                                        yield Ok(StreamChunk::Text { content: text.to_string() });
+                                                    }
+                                                    if let Some(fn_call) = part.get("functionCall") {
+                                                        let name = fn_call["name"].as_str().unwrap_or("").to_string();
+                                                        let args = fn_call["args"].clone();
+                                                        let arguments = serde_json::to_string(&args).unwrap_or_default();
+                                                        let tool_call = ToolCall {
+                                                            id: format!("call_{}", Uuid::new_v4().simple()),
+                                                            r#type: "function".to_string(),
+                                                            index: Some(0),
+                                                            function: FunctionCall {
+                                                                name,
+                                                                arguments,
+                                                            },
+                                                        };
+                                                        yield Ok(StreamChunk::ToolCall { tool_call });
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    buffer.drain(..offset);
                                 }
-                             }
-                             buffer.clear();
+                                _ => {
+                                    break;
+                                }
+                            }
                         }
                     }
                     Err(e) => yield Err(anyhow::Error::from(e)),

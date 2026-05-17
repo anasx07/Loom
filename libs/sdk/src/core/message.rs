@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -9,7 +10,7 @@ pub enum Role {
     Tool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolCall {
     #[serde(default)]
     pub index: Option<usize>,
@@ -18,18 +19,19 @@ pub struct ToolCall {
     pub function: FunctionCall,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FunctionCall {
     pub name: String,
     pub arguments: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Message {
     pub role: Role,
-    pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub thought: Option<String>,
+    pub content: Option<Arc<str>>,
+    #[serde(rename = "reasoning_content", skip_serializing_if = "Option::is_none")]
+    pub thought: Option<Arc<str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -39,7 +41,7 @@ pub struct Message {
 }
 
 impl Message {
-    pub fn user(content: impl Into<String>) -> Self {
+    pub fn user(content: impl Into<Arc<str>>) -> Self {
         Self {
             role: Role::User,
             content: Some(content.into()),
@@ -51,8 +53,8 @@ impl Message {
     }
 
     pub fn assistant(
-        content: Option<String>,
-        thought: Option<String>,
+        content: Option<Arc<str>>,
+        thought: Option<Arc<str>>,
         tool_calls: Option<Vec<ToolCall>>,
     ) -> Self {
         Self {
@@ -65,10 +67,10 @@ impl Message {
         }
     }
 
-    pub fn tool(id: String, name: String, content: String) -> Self {
+    pub fn tool(id: String, name: String, content: impl Into<Arc<str>>) -> Self {
         Self {
             role: Role::Tool,
-            content: Some(content),
+            content: Some(content.into()),
             thought: None,
             tool_calls: None,
             tool_call_id: Some(id),
@@ -76,7 +78,7 @@ impl Message {
         }
     }
 
-    pub fn system(content: impl Into<String>) -> Self {
+    pub fn system(content: impl Into<Arc<str>>) -> Self {
         Self {
             role: Role::System,
             content: Some(content.into()),

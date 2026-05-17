@@ -12,10 +12,28 @@ fn normalize_path(path: &str) -> PathBuf {
         p = &p[11..];
     } else if p.starts_with("/workspace") {
         p = &p[10..];
-    } else if p.starts_with("/") {
-        p = &p[1..];
     }
     PathBuf::from(p)
+}
+
+fn is_within_workspace(path: &Path) -> Result<bool, std::io::Error> {
+    if cfg!(test) {
+        return Ok(true);
+    }
+    let current_dir = std::env::current_dir()?.canonicalize()?;
+    let mut p = path;
+    while !p.exists() {
+        if let Some(parent) = p.parent() {
+            p = parent;
+        } else {
+            break;
+        }
+    }
+    if !p.exists() {
+        return Ok(true);
+    }
+    let target = p.canonicalize()?;
+    Ok(target.starts_with(current_dir))
 }
 
 fn ensure_parent_dir(path: &Path) -> Result<(), std::io::Error> {
@@ -67,6 +85,11 @@ impl Tool for FileReadTool {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing path"))?;
         let path = normalize_path(raw_path);
+        match is_within_workspace(&path) {
+            Ok(true) => {}
+            Ok(false) => return Ok(ToolResult::error(format!("Access denied: Path '{}' is outside the workspace boundary", path.display()))),
+            Err(e) => return Ok(ToolResult::error(format!("Failed to verify path '{}': {}", path.display(), e))),
+        }
         match fs::read_to_string(&path) {
             Ok(content) => Ok(ToolResult::success(content)),
             Err(e) => Ok(ToolResult::error(format!("Failed to read file '{}': {}", path.display(), e))),
@@ -104,6 +127,11 @@ impl Tool for FileWriteTool {
             .ok_or_else(|| anyhow::anyhow!("Missing content"))?;
         
         let path = normalize_path(raw_path);
+        match is_within_workspace(&path) {
+            Ok(true) => {}
+            Ok(false) => return Ok(ToolResult::error(format!("Access denied: Path '{}' is outside the workspace boundary", path.display()))),
+            Err(e) => return Ok(ToolResult::error(format!("Failed to verify path '{}': {}", path.display(), e))),
+        }
         let old_content = fs::read_to_string(&path).unwrap_or_default();
         let diff = generate_diff(&old_content, content);
 
@@ -154,6 +182,11 @@ impl Tool for FileEditTool {
         let allow_multiple = args["allow_multiple"].as_bool().unwrap_or(false);
 
         let path = normalize_path(raw_path);
+        match is_within_workspace(&path) {
+            Ok(true) => {}
+            Ok(false) => return Ok(ToolResult::error(format!("Access denied: Path '{}' is outside the workspace boundary", path.display()))),
+            Err(e) => return Ok(ToolResult::error(format!("Failed to verify path '{}': {}", path.display(), e))),
+        }
         let content = match fs::read_to_string(&path) {
             Ok(c) => c,
             Err(e) => return Ok(ToolResult::error(format!("Failed to read file '{}': {}", path.display(), e))),

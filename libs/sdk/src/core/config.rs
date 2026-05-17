@@ -21,6 +21,24 @@ pub struct Config {
     pub favorites: Vec<DynamicModelInfo>,
     #[serde(default)]
     pub recent_models: Vec<DynamicModelInfo>,
+    #[serde(default = "default_thinking_level")]
+    pub thinking_level: String,
+    #[serde(default = "default_logo_animation")]
+    pub logo_animation: String,
+    #[serde(default = "default_logo_animation_color")]
+    pub logo_animation_color: String,
+}
+
+fn default_thinking_level() -> String {
+    "default".to_string()
+}
+
+fn default_logo_animation() -> String {
+    "always".to_string()
+}
+
+fn default_logo_animation_color() -> String {
+    "rainbow".to_string()
 }
 
 impl Default for Config {
@@ -34,6 +52,9 @@ impl Default for Config {
             last_update_check: 0.0,
             favorites: Vec::new(),
             recent_models: Vec::new(),
+            thinking_level: "default".to_string(),
+            logo_animation: "always".to_string(),
+            logo_animation_color: "rainbow".to_string(),
         }
     }
 }

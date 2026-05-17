@@ -20,7 +20,10 @@ impl CloudflareWorkersAI {
         Self {
             account_id,
             api_token,
-            client: Client::new(),
+            client: Client::builder()
+                .timeout(std::time::Duration::from_secs(60))
+                .build()
+                .unwrap_or_else(|_| Client::new()),
         }
     }
 }
@@ -94,6 +97,7 @@ impl AIProvider for CloudflareWorkersAI {
         messages: Vec<Message>,
         model: &str,
         _tools: Option<Vec<Value>>,
+        _thinking_level: Option<&str>,
     ) -> Result<StreamResponse, anyhow::Error> {
         // Workers AI has an OpenAI-compatible endpoint now, which is easier to use.
         let url = format!(
@@ -101,11 +105,17 @@ impl AIProvider for CloudflareWorkersAI {
             self.account_id
         );
 
-        let body = json!({
+        let mut body = json!({
             "model": model,
             "messages": messages,
             "stream": true,
         });
+
+        if let Some(t) = _tools {
+            if !t.is_empty() {
+                body["tools"] = json!(t);
+            }
+        }
 
         let response = self
             .client
@@ -129,9 +139,7 @@ impl AIProvider for CloudflareWorkersAI {
                 match item {
                     Ok(bytes) => {
                         let chunks = parse_sse_buffer(&mut buffer, &mut active_tool_calls, &String::from_utf8_lossy(&bytes));
-                        for chunk in chunks {
-                            yield Ok(chunk);
-                        }
+                        for chunk in chunks { yield Ok(chunk); }
                     }
                     Err(e) => yield Err(anyhow::Error::from(e)),
                 }
@@ -156,7 +164,10 @@ impl CloudflareAIGateway {
             account_id,
             gateway_id,
             api_token,
-            client: Client::new(),
+            client: Client::builder()
+                .timeout(std::time::Duration::from_secs(60))
+                .build()
+                .unwrap_or_else(|_| Client::new()),
         }
     }
 }
@@ -176,6 +187,7 @@ impl AIProvider for CloudflareAIGateway {
         messages: Vec<Message>,
         model: &str,
         tools: Option<Vec<Value>>,
+        _thinking_level: Option<&str>,
     ) -> Result<StreamResponse, anyhow::Error> {
         // AI Gateway works as a proxy.
         // If the model is in "provider/model" format, we use the /compat endpoint.
@@ -216,9 +228,7 @@ impl AIProvider for CloudflareAIGateway {
                 match item {
                     Ok(bytes) => {
                         let chunks = parse_sse_buffer(&mut buffer, &mut active_tool_calls, &String::from_utf8_lossy(&bytes));
-                        for chunk in chunks {
-                            yield Ok(chunk);
-                        }
+                        for chunk in chunks { yield Ok(chunk); }
                     }
                     Err(e) => yield Err(anyhow::Error::from(e)),
                 }

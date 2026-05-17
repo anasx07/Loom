@@ -1,4 +1,5 @@
 use crate::agents::traits::{AIProvider, StreamResponse};
+use crate::agents::types::StreamChunk;
 use crate::agents::utils::parse_sse_buffer;
 use crate::core::{Message, ToolCall};
 use async_stream::stream;
@@ -21,7 +22,10 @@ impl OpenAIProvider {
             api_key,
             base_url,
             provider_name,
-            client: Client::new(),
+            client: Client::builder()
+                .timeout(std::time::Duration::from_secs(60))
+                .build()
+                .unwrap_or_else(|_| Client::new()),
         }
     }
 }
@@ -69,15 +73,23 @@ impl AIProvider for OpenAIProvider {
         messages: Vec<Message>,
         model: &str,
         tools: Option<Vec<serde_json::Value>>,
+        thinking_level: Option<&str>,
     ) -> Result<StreamResponse, anyhow::Error> {
         let mut body = json!({
             "model": model,
             "messages": messages,
             "stream": true,
+            "max_tokens": 16384,
         });
 
         if let Some(t) = tools {
             body["tools"] = json!(t);
+        }
+        
+        if let Some(level) = thinking_level {
+            if level != "default" {
+                body["thinking_level"] = json!(level);
+            }
         }
 
         let url = if self.base_url.ends_with('/') {
@@ -115,14 +127,14 @@ impl AIProvider for OpenAIProvider {
                         for chunk in chunks {
                             yield Ok(chunk);
                         }
-                    }
-                    Err(e) => {
+                        }
+                        Err(e) => {
                         yield Err(anyhow::Error::from(e));
-                    }
-                }
-            }
-        };
-
+                        }
+                        }
+                        }
+                        yield Ok(StreamChunk::Done);
+                        };
         Ok(Box::pin(s))
     }
 }

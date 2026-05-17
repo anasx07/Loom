@@ -55,7 +55,7 @@ pub fn resolve_provider(provider_name: &str, api_key: String) -> std::sync::Arc<
         )),
         "opencode-zen" | "opencode_zen" => std::sync::Arc::new(OpenCodeProvider::new(
             api_key,
-            "https://opencode.ai/zen/go/v1".to_string(),
+            "https://opencode.ai/zen/v1".to_string(),
             "OpenCode Zen".to_string(),
             true,
         )),

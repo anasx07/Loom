@@ -41,15 +41,16 @@ pub enum Commands {
 mod ui;
 
 use crossterm::{
-    event::{DisableMouseCapture, EnableMouseCapture},
+    event::{EnableBracketedPaste, DisableBracketedPaste},
     execute,
+    style::Print,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 use routecode_sdk::core::AgentOrchestrator;
 use routecode_sdk::tools::bash::BashTool;
 use routecode_sdk::tools::file_ops::{FileEditTool, FileReadTool, FileWriteTool};
-use routecode_sdk::tools::navigation::{GrepTool, LsTool};
+use routecode_sdk::tools::navigation::{GrepTool, LsTool, TreeTool};
 use routecode_sdk::tools::ToolRegistry;
 use std::io;
 use std::process::Command;
@@ -72,35 +73,53 @@ async fn main() -> anyhow::Result<()> {
 
     let log_level = if cli.debug { LevelFilter::Debug } else { LevelFilter::Info };
     
-    CombinedLogger::init(vec![
+    let loggers: Vec<Box<dyn SharedLogger>> = vec![
         WriteLogger::new(
             log_level,
             ConfigBuilder::new().set_time_format_rfc3339().build(),
             File::create(&log_path)?,
         ),
-    ])?;
+    ];
+
+    // Only use TermLogger if we are NOT about to enter TUI mode immediately, 
+    // or if it's a headless run. But for now, let's just use it for the very beginning.
+    // Actually, simplelog doesn't support easy removal, so we'll just use WriteLogger
+    // and manual printlns for the very early stages if needed.
+    
+    CombinedLogger::init(loggers)?;
+
+    log::info!("Starting RouteCode v{}", env!("CARGO_PKG_VERSION"));
 
     if cli.debug {
         log::debug!("Debug mode active. Spawning log window...");
         // Spawn a new terminal window to tail the log file
         #[cfg(target_os = "windows")]
         {
-            let _ = Command::new("cmd")
-                .args(["/C", "start", "powershell", "-NoExit", "-Command", &format!("Get-Content -Path '{}' -Wait", log_path.display())])
-                .spawn();
+            if let Err(e) = Command::new("cmd")
+                .args(["/C", "start", "powershell", "-NoExit", "-Command", &format!("Get-Content -Path \"{}\" -Wait", log_path.display())])
+                .spawn()
+            {
+                log::warn!("Failed to spawn debug log window: {}", e);
+            }
         }
         #[cfg(target_os = "macos")]
         {
-            let _ = Command::new("osascript")
+            if let Err(e) = Command::new("osascript")
                 .args(["-e", &format!("tell application \"Terminal\" to do script \"tail -f '{}'\"", log_path.display())])
-                .spawn();
+                .spawn()
+            {
+                log::warn!("Failed to spawn debug log window: {}", e);
+            }
         }
         #[cfg(target_os = "linux")]
         {
             // Try common terminal emulators
-            let _ = Command::new("x-terminal-emulator")
+            if let Err(e) = Command::new("x-terminal-emulator")
                 .args(["-e", "tail", "-f", &log_path.display().to_string()])
-                .spawn();
+                .spawn()
+            {
+                log::warn!("Failed to spawn debug log window: {}", e);
+            }
         }
     }
 
@@ -148,6 +167,7 @@ async fn main() -> anyhow::Result<()> {
     tool_registry.register(Arc::new(FileEditTool));
     tool_registry.register(Arc::new(BashTool));
     tool_registry.register(Arc::new(LsTool));
+    tool_registry.register(Arc::new(TreeTool));
     tool_registry.register(Arc::new(GrepTool));
     let tool_registry = Arc::new(tool_registry);
 
@@ -161,7 +181,7 @@ async fn main() -> anyhow::Result<()> {
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen, Print("\x1b[?1003h\x1b[?1006h"), EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -177,8 +197,19 @@ async fn main() -> anyhow::Result<()> {
                 app.current_model = session.model;
                 let mut u = app.orchestrator.usage.lock().await;
                 *u = session.usage;
+                app.session_id = resume_name.clone();
+                if let Ok(config) = routecode_sdk::utils::storage::load_session_config(&resume_name) {
+                    app.orchestrator.allow_session_commands.store(config.allow_all_commands, std::sync::atomic::Ordering::SeqCst);
+                    app.orchestrator.allow_session_outside_access.store(config.allow_all_outside_access, std::sync::atomic::Ordering::SeqCst);
+                }
             }
-            Err(e) => eprintln!("Failed to resume session: {}", e),
+            Err(e) => app.history.push(routecode_sdk::core::Message::system(format!("Failed to resume session '{}': {}", resume_name, e))),
+        }
+    }
+    
+    if let Ok(workspace_config) = routecode_sdk::utils::storage::load_workspace_config() {
+        if workspace_config.allow_all_outside_access {
+            app.orchestrator.allow_session_outside_access.store(true, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
@@ -189,7 +220,8 @@ async fn main() -> anyhow::Result<()> {
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
-        DisableMouseCapture
+        Print("\x1b[?1003l\x1b[?1006l"),
+        DisableBracketedPaste
     )?;
     terminal.show_cursor()?;
 

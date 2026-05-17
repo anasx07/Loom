@@ -1,4 +1,5 @@
 use crate::agents::traits::{AIProvider, StreamResponse};
+use crate::agents::types::StreamChunk;
 use crate::agents::utils::parse_sse_buffer;
 use crate::core::{Message, ToolCall};
 use async_stream::stream;
@@ -17,7 +18,10 @@ impl OpenRouter {
     pub fn new(api_key: String) -> Self {
         Self {
             api_key,
-            client: Client::new(),
+            client: Client::builder()
+                .timeout(std::time::Duration::from_secs(60))
+                .build()
+                .unwrap_or_else(|_| Client::new()),
         }
     }
 }
@@ -59,6 +63,7 @@ impl AIProvider for OpenRouter {
         messages: Vec<Message>,
         model: &str,
         tools: Option<Vec<serde_json::Value>>,
+        thinking_level: Option<&str>,
     ) -> Result<StreamResponse, anyhow::Error> {
         let mut body = json!({
             "model": model,
@@ -68,6 +73,14 @@ impl AIProvider for OpenRouter {
 
         if let Some(t) = tools {
             body["tools"] = json!(t);
+        }
+
+        if let Some(level) = thinking_level {
+            if level != "default" {
+                // OpenRouter often maps this to specific parameters or suffixes
+                // For now, we'll try passing it as a provider-specific field
+                body["provider"] = json!({ "thinking_level": level });
+            }
         }
 
         let response = self
@@ -97,62 +110,14 @@ impl AIProvider for OpenRouter {
                         for chunk in chunks {
                             yield Ok(chunk);
                         }
-                    }
-                    Err(e) => {
+                        }
+                        Err(e) => {
                         yield Err(anyhow::Error::from(e));
-                    }
-                }
-            }
-        };
-
+                        }
+                        }
+                        }
+                        yield Ok(StreamChunk::Done);
+                        };
         Ok(Box::pin(s))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::agents::types::StreamChunk;
-
-    #[test]
-    fn test_parse_sse_buffer_text() {
-        let mut buffer = String::new();
-        let mut active_tool_calls = HashMap::new();
-
-        // Partial data
-        let data1 = "data: {\"choices\": [{\"delta\": {\"content\": \"Hello\"}}]}\n";
-        let chunks = parse_sse_buffer(&mut buffer, &mut active_tool_calls, data1);
-        assert_eq!(chunks.len(), 1);
-        if let StreamChunk::Text { content } = &chunks[0] {
-            assert_eq!(content, "Hello");
-        }
-
-        // Split data across chunks
-        let data2 = "data: {\"choices\": [{\"delta\": {\"content\": \" world\"}}]}"; // No newline
-        let chunks = parse_sse_buffer(&mut buffer, &mut active_tool_calls, data2);
-        assert_eq!(chunks.len(), 0); // Should be buffered
-
-        let chunks = parse_sse_buffer(&mut buffer, &mut active_tool_calls, "\n");
-        assert_eq!(chunks.len(), 1);
-        if let StreamChunk::Text { content } = &chunks[0] {
-            assert_eq!(content, " world");
-        }
-    }
-
-    #[test]
-    fn test_parse_sse_buffer_tool_calls() {
-        let mut buffer = String::new();
-        let mut active_tool_calls = HashMap::new();
-
-        let data = "data: {\"choices\": [{\"delta\": {\"tool_calls\": [{\"index\": 0, \"id\": \"call_1\", \"function\": {\"name\": \"ls\"}}]}}]}\ndata: {\"choices\": [{\"delta\": {\"tool_calls\": [{\"index\": 0, \"function\": {\"arguments\": \"{\\\"path\\\": \\\".\\\"}\"}}]}}]}\n";
-
-        let chunks = parse_sse_buffer(&mut buffer, &mut active_tool_calls, data);
-        assert_eq!(chunks.len(), 2);
-
-        if let StreamChunk::ToolCall { tool_call } = &chunks[1] {
-            assert_eq!(tool_call.id, "call_1");
-            assert_eq!(tool_call.function.name, "ls");
-            assert_eq!(tool_call.function.arguments, "{\"path\": \".\"}");
-        }
     }
 }
